@@ -1,8 +1,8 @@
 {
-    "course_id": "123456",
+    "course_id": "676767",
     "assignments": [
-        {"assignment_id": "789012", "assignment_name": "HW3 - Sorting Algorithms"},
-        {"assignment_id": "789013", "assignment_name": "HW4 - Linked Lists"}
+        {"assignment_id": "676767", "assignment_name": "HW3 - Sorting Algorithms"},
+        {"assignment_id": "676767", "assignment_name": "HW4 - Linked Lists"}
     ],
     "cookies": {
         "signed_token": "your_signed_token_here",
