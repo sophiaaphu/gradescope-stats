@@ -4,6 +4,9 @@ config.json
 # Generated distribution graphs
 stat_distribution_graphs/
 
+# Generated stats text output
+stats/
+
 # Python
 __pycache__/
 *.py[cod]

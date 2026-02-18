@@ -16,11 +16,40 @@ import json
 from tabulate import tabulate
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
+import sys
+import os
 try:
     from supabase import create_client
     SUPABASE_AVAILABLE = True
 except ImportError:
     SUPABASE_AVAILABLE = False
+
+
+class Tee:
+    """Mirrors all writes to both the terminal and a file."""
+    def __init__(self, filepath):
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        self._file = open(filepath, 'w', encoding='utf-8')
+        self._stdout = sys.stdout
+
+    def write(self, data):
+        self._stdout.write(data)
+        self._file.write(data)
+
+    def flush(self):
+        self._stdout.flush()
+        self._file.flush()
+
+    def close(self):
+        sys.stdout = self._stdout
+        self._file.close()
+
+    def __enter__(self):
+        sys.stdout = self
+        return self
+
+    def __exit__(self, *args):
+        self.close()
 
 
 class GradescopeSeleniumStats:
@@ -58,6 +87,12 @@ class GradescopeSeleniumStats:
         )
         self.wait = WebDriverWait(self.driver, 10)
     
+    def set_assignment(self, assignment_id, assignment_name=None):
+        """Switch to a different assignment without restarting the browser."""
+        self.assignment_id = assignment_id
+        self.assignment_name = assignment_name or f"Assignment {assignment_id}"
+        self.submissions = []
+
     def login_with_cookies(self, cookies):
         """Login to Gradescope using saved cookies."""
         print("Loading Gradescope...")
@@ -447,8 +482,20 @@ def setup_config():
     print()
     
     config['course_id'] = input("Enter Course ID: ").strip()
-    config['assignment_id'] = input("Enter Assignment ID: ").strip()
-    config['assignment_name'] = input("Enter Assignment Name (e.g. HW3, Lab 5): ").strip()
+
+    config['assignments'] = []
+    print("\nEnter assignments to analyze (leave Assignment ID blank to finish):")
+    while True:
+        assignment_id = input("  Assignment ID: ").strip()
+        if not assignment_id:
+            break
+        assignment_name = input("  Assignment Name (e.g. HW3, Lab 5): ").strip()
+        config['assignments'].append({'assignment_id': assignment_id, 'assignment_name': assignment_name})
+        print(f"  Added. ({len(config['assignments'])} total) Enter another or leave blank to finish.\n")
+
+    if not config['assignments']:
+        print("No assignments added. Exiting.")
+        return config
     
     print("\nTo get your authentication cookies:")
     print("1. Log in to Gradescope in your browser")
@@ -470,6 +517,22 @@ def setup_config():
     return config
 
 
+def _stats_filepath(assignment_name):
+    """Return the path to save stats text for a given assignment."""
+    safe_name = "".join(c if c.isalnum() or c in " -_" else "_" for c in assignment_name).strip()
+    return os.path.join("stats", f"{safe_name}_stats.txt")
+
+
+def get_assignments(config):
+    """Return assignments list, supporting both old single and new multi-assignment format."""
+    if 'assignments' in config:
+        return config['assignments']
+    # Backward compat: single assignment at top level
+    if 'assignment_id' in config:
+        return [{'assignment_id': config['assignment_id'], 'assignment_name': config.get('assignment_name', '')}]
+    return []
+
+
 def main():
     """Main entry point."""
     print("\nGradescope Statistics Analyzer (Selenium Version)")
@@ -480,13 +543,18 @@ def main():
         print("\nNo configuration found. Let's set it up!")
         config = setup_config()
     else:
-        assignment_label = config.get('assignment_name') or config['assignment_id']
-        print(f"\nUsing saved configuration for course {config['course_id']}, assignment: {assignment_label}")
+        assignments = get_assignments(config)
+        labels = ", ".join(a.get('assignment_name') or a['assignment_id'] for a in assignments)
+        print(f"\nCourse {config['course_id']} — {len(assignments)} assignment(s): {labels}")
         reconfigure = input("Reconfigure? (y/n): ").strip().lower()
         if reconfigure == 'y':
             config = setup_config()
 
-    # Choose mode
+    assignments = get_assignments(config)
+    if not assignments:
+        print("No assignments configured. Please reconfigure.")
+        return
+
     has_supabase = bool(config.get('supabase_url') and config.get('supabase_key'))
     print("\nWhat would you like to do?")
     print("  1. Scrape Gradescope (opens browser)")
@@ -495,38 +563,56 @@ def main():
     mode = input("Enter 1 or 2: ").strip()
 
     if mode == '2' and has_supabase:
-        # --- Database mode: no browser needed ---
-        analyzer = GradescopeSeleniumStats(
-            config['course_id'],
-            config['assignment_id'],
-            assignment_name=config.get('assignment_name'),
-            skip_browser=True,
-        )
-        loaded = analyzer.load_from_supabase(config['supabase_url'], config['supabase_key'])
-        if loaded:
-            analyzer.calculate_statistics()
+        # --- Database mode: show each assignment from DB ---
+        for assignment in assignments:
+            analyzer = GradescopeSeleniumStats(
+                config['course_id'],
+                assignment['assignment_id'],
+                assignment_name=assignment.get('assignment_name'),
+                skip_browser=True,
+            )
+            loaded = analyzer.load_from_supabase(config['supabase_url'], config['supabase_key'])
+            if loaded:
+                stat_file = _stats_filepath(analyzer.assignment_name)
+                with Tee(stat_file):
+                    analyzer.calculate_statistics()
+                print(f"Stats saved to: {stat_file}")
+
     else:
-        # --- Scrape mode ---
+        # --- Scrape mode: one browser session, loop through assignments ---
         test_input = input("\nRun in TEST mode? Enter number of students to test (e.g. 3), or press Enter for all: ").strip()
         test_limit = None
         if test_input.isdigit() and int(test_input) > 0:
             test_limit = int(test_input)
-            print(f"Test mode: will process only {test_limit} student(s).")
+            print(f"Test mode: will process only {test_limit} student(s) per assignment.")
 
         analyzer = None
         try:
+            # Init browser once using the first assignment
+            first = assignments[0]
             analyzer = GradescopeSeleniumStats(
                 config['course_id'],
-                config['assignment_id'],
-                assignment_name=config.get('assignment_name'),
+                first['assignment_id'],
+                assignment_name=first.get('assignment_name'),
                 test_limit=test_limit,
             )
             analyzer.login_with_cookies(config['cookies'])
-            analyzer.fetch_submissions()
-            analyzer.calculate_statistics()
 
-            if has_supabase:
-                analyzer.save_to_supabase(config['supabase_url'], config['supabase_key'])
+            for i, assignment in enumerate(assignments):
+                print(f"\n{'='*70}")
+                print(f"Assignment {i+1}/{len(assignments)}: {assignment.get('assignment_name') or assignment['assignment_id']}")
+                print("="*70)
+
+                analyzer.set_assignment(assignment['assignment_id'], assignment.get('assignment_name'))
+                analyzer.fetch_submissions()
+
+                stat_file = _stats_filepath(analyzer.assignment_name)
+                with Tee(stat_file):
+                    analyzer.calculate_statistics()
+                print(f"Stats saved to: {stat_file}")
+
+                if has_supabase:
+                    analyzer.save_to_supabase(config['supabase_url'], config['supabase_key'])
 
         except Exception as e:
             print(f"\nError: {e}")
