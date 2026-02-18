@@ -1,0 +1,11 @@
+{
+    "course_id": "123456",
+    "assignment_id": "789012",
+    "assignment_name": "HW3 - Sorting Algorithms",
+    "cookies": {
+        "signed_token": "your_signed_token_here",
+        "_gradescope_session": "your_session_cookie_here"
+    },
+    "supabase_url": "https://your-project.supabase.co",
+    "supabase_key": "your_anon_key_here"
+}
