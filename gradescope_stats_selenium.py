@@ -19,6 +19,12 @@ import matplotlib.ticker as ticker
 import sys
 import os
 try:
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+    EXCEL_AVAILABLE = True
+except ImportError:
+    EXCEL_AVAILABLE = False
+try:
     from supabase import create_client
     SUPABASE_AVAILABLE = True
 except ImportError:
@@ -76,9 +82,10 @@ class GradescopeSeleniumStats:
 
         # Setup Chrome driver
         options = webdriver.ChromeOptions()
-        # options.add_argument('--headless')
+        options.add_argument('--headless')
         options.add_argument('--disable-blink-features=AutomationControlled')
         options.add_argument('--start-maximized')
+        options.add_argument('--window-size=1920,1080')
         
         print("Initializing browser...")
         self.driver = webdriver.Chrome(
@@ -212,6 +219,8 @@ class GradescopeSeleniumStats:
                     'attempts': 0,
                     'timestamps': [],
                     'time_span_hours': 0.0,
+                    'first_submission_at': None,
+                    'last_submission_at': None,
                     'submission_id': submission_id,
                 })
                 self.driver.close()
@@ -250,23 +259,34 @@ class GradescopeSeleniumStats:
                     if len(cols) > 1:
                         timestamps.append(cols[1].text.strip())
 
-            # Calculate time span between first and last submission
-            if len(parsed_times) >= 2:
+            # Calculate time span and store first/last timestamps
+            if parsed_times:
                 first_sub = min(parsed_times)
                 last_sub = max(parsed_times)
-                time_span_hours = (last_sub - first_sub).total_seconds() / 3600
+                first_submission_at = first_sub.isoformat()
+                last_submission_at = last_sub.isoformat()
+                if len(parsed_times) >= 2:
+                    time_span_hours = (last_sub - first_sub).total_seconds() / 3600
+                else:
+                    time_span_hours = 0.0
             else:
+                first_submission_at = None
+                last_submission_at = None
                 time_span_hours = 0.0
 
         except Exception as e:
             print(f"  Error fetching history for {student_name}: {e}")
+            first_submission_at = None
+            last_submission_at = None
 
-        span_str = self._format_time(time_span_hours) if time_span_hours > 0 else "—"
+        span_str = self._format_time(time_span_hours) if (time_span_hours or 0) > 0 else "—"
         self.submissions.append({
             'name': student_name,
             'attempts': attempts,
             'timestamps': timestamps,
             'time_span_hours': time_span_hours,
+            'first_submission_at': first_submission_at,
+            'last_submission_at': last_submission_at,
             'submission_id': submission_id,
         })
         print(f"  -> {attempts} attempt(s), span: {span_str}")
@@ -292,13 +312,14 @@ class GradescopeSeleniumStats:
         print(f"  {'Name':<40} {'Attempts':>8}  {'Time Span':>12}")
         print(f"  {'-'*40}  {'-'*8}  {'-'*12}")
         for s in self.submissions:
-            span_str = self._format_time(s['time_span_hours']) if s['time_span_hours'] > 0 else "—"
+            span = s.get('time_span_hours') or 0.0
+            span_str = self._format_time(span) if span > 0 else "—"
             print(f"  {s['name']:<40} {s['attempts']:>8}  {span_str:>12}")
 
         # Extract metrics (exclude students with 0 attempts from stats)
-        active = [s for s in self.submissions if s['attempts'] > 0]
+        active = [s for s in self.submissions if s.get('attempts', 0) > 0]
         attempt_counts = [s['attempts'] for s in active]
-        time_spans = [s['time_span_hours'] for s in active if s['time_span_hours'] > 0]
+        time_spans = [s.get('time_span_hours') or 0.0 for s in active if (s.get('time_span_hours') or 0.0) > 0]
 
         print("\n" + "="*70)
         print(f"SUBMISSION STATISTICS — {self.assignment_name}")
@@ -404,11 +425,13 @@ class GradescopeSeleniumStats:
 
         self.submissions = [
             {
-                'name':            row['student_name'],
-                'attempts':        row['attempts'],
-                'time_span_hours': row['time_span_hours'] or 0.0,
-                'timestamps':      [],
-                'submission_id':   None,
+                'name':                row['student_name'],
+                'attempts':            row.get('attempts') or 0,
+                'time_span_hours':     row.get('time_span_hours') or 0.0,
+                'first_submission_at': row.get('first_submission_at'),
+                'last_submission_at':  row.get('last_submission_at'),
+                'timestamps':          [],
+                'submission_id':       None,
             }
             for row in result.data
         ]
@@ -432,11 +455,13 @@ class GradescopeSeleniumStats:
 
         rows = [
             {
-                'assignment_id':   self.assignment_id,
-                'student_name':    s['name'],
-                'assignment_name': self.assignment_name,
-                'attempts':        s['attempts'],
-                'time_span_hours': s['time_span_hours'] if s['time_span_hours'] > 0 else None,
+                'assignment_id':       self.assignment_id,
+                'student_name':        s.get('name'),
+                'assignment_name':     self.assignment_name,
+                'attempts':            s.get('attempts', 0),
+                'time_span_hours':     s.get('time_span_hours') or None,
+                'first_submission_at': s.get('first_submission_at'),
+                'last_submission_at':  s.get('last_submission_at'),
             }
             for s in self.submissions
         ]
@@ -447,6 +472,60 @@ class GradescopeSeleniumStats:
             on_conflict='assignment_id,student_name'
         ).execute()
         print(f"Saved successfully.")
+
+    def save_to_excel(self):
+        """Save per-student data to a formatted Excel file in the stats/ folder."""
+        if not EXCEL_AVAILABLE:
+            print("openpyxl not installed. Run: pip install openpyxl")
+            return
+        if not self.submissions:
+            print("No data to export.")
+            return
+
+        os.makedirs("stats", exist_ok=True)
+        safe_name = "".join(c if c.isalnum() or c in " -_" else "_" for c in self.assignment_name).strip()
+        filepath = os.path.join("stats", f"{safe_name}_students.xlsx")
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Submissions"
+
+        # Header style
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill("solid", fgColor="2F5496")
+        center = Alignment(horizontal="center")
+
+        headers = ["Name", "Attempts", "Time Span (hrs)", "First Submission", "Last Submission"]
+        col_widths = [35, 12, 18, 28, 28]
+
+        for col, (header, width) in enumerate(zip(headers, col_widths), start=1):
+            cell = ws.cell(row=1, column=col, value=header)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = center
+            ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = width
+
+        # Alternating row fill
+        alt_fill = PatternFill("solid", fgColor="DCE6F1")
+
+        for row_idx, s in enumerate(self.submissions, start=2):
+            fill = alt_fill if row_idx % 2 == 0 else PatternFill()
+            span = s.get('time_span_hours') or 0.0
+            values = [
+                s.get('name'),
+                s.get('attempts', 0),
+                round(span, 2) if span > 0 else None,
+                s.get('first_submission_at'),
+                s.get('last_submission_at'),
+            ]
+            for col, value in enumerate(values, start=1):
+                cell = ws.cell(row=row_idx, column=col, value=value)
+                cell.fill = fill
+                if col in (2, 3):
+                    cell.alignment = center
+
+        wb.save(filepath)
+        print(f"Excel file saved to: {filepath}")
 
     def cleanup(self):
         """Close the browser."""
@@ -577,6 +656,7 @@ def main():
                 with Tee(stat_file):
                     analyzer.calculate_statistics()
                 print(f"Stats saved to: {stat_file}")
+                analyzer.save_to_excel()
 
     else:
         # --- Scrape mode: one browser session, loop through assignments ---
@@ -610,6 +690,7 @@ def main():
                 with Tee(stat_file):
                     analyzer.calculate_statistics()
                 print(f"Stats saved to: {stat_file}")
+                analyzer.save_to_excel()
 
                 if has_supabase:
                     analyzer.save_to_supabase(config['supabase_url'], config['supabase_key'])

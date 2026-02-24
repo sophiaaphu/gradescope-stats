@@ -26,11 +26,13 @@ Create a free project at [supabase.com](https://supabase.com), then run this in 
 
 ```sql
 CREATE TABLE submission_stats (
-    assignment_id   TEXT,
-    student_name    TEXT,
-    assignment_name TEXT,
-    attempts        INTEGER,
-    time_span_hours FLOAT,
+    assignment_id        TEXT,
+    student_name         TEXT,
+    assignment_name      TEXT,
+    attempts             INTEGER,
+    time_span_hours      FLOAT,
+    first_submission_at  TIMESTAMPTZ,
+    last_submission_at   TIMESTAMPTZ,
     PRIMARY KEY (assignment_id, student_name)
 );
 ```
@@ -46,8 +48,10 @@ Fill in `config.json`:
 ```json
 {
     "course_id": "123456",
-    "assignment_id": "789012",
-    "assignment_name": "HW3 - Sorting Algorithms",
+    "assignments": [
+        {"assignment_id": "789012", "assignment_name": "HW3 - Sorting Algorithms"},
+        {"assignment_id": "789013", "assignment_name": "HW4 - Linked Lists"}
+    ],
     "cookies": {
         "signed_token": "your_signed_token_here",
         "_gradescope_session": "your_session_cookie_here"
@@ -127,8 +131,7 @@ Two histograms are saved to `stat_distribution_graphs/` as a PNG:
 | Field | Required | Description |
 |---|---|---|
 | `course_id` | Yes | From the Gradescope URL |
-| `assignment_id` | Yes | From the Gradescope URL |
-| `assignment_name` | Yes | Human-readable label (used in output and filenames) |
+| `assignments` | Yes | List of `{assignment_id, assignment_name}` objects |
 | `cookies` | Yes | `_gradescope_session` and `signed_token` from your browser |
 | `supabase_url` | Yes | Your Supabase project URL |
 | `supabase_key` | Yes | Your Supabase anon key |
@@ -150,7 +153,7 @@ Results are automatically saved to Supabase after every scrape. Running the scra
 
 ## Privacy & Security
 
-- `config.json` and `stat_distribution_graphs/` are excluded from git via `.gitignore`
+- `config.json`, `stat_distribution_graphs/`, and `stats/` are excluded from git via `.gitignore`
 - Never share your cookies — they give full access to your Gradescope account
 
 ## License
