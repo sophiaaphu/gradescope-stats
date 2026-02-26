@@ -305,27 +305,28 @@ class GradescopeSeleniumStats:
             print("No submission data collected.")
             return
 
-        # Per-student breakdown
+        # Only count students with at least one submission in stats and table
+        active = [s for s in self.submissions if s.get('attempts', 0) > 0]
+        attempt_counts = [s['attempts'] for s in active]
+        time_spans = [s.get('time_span_hours') or 0.0 for s in active if (s.get('time_span_hours') or 0.0) > 0]
+
+        # Per-student breakdown (only students with ≥1 submission)
         print("\n" + "="*70)
         print(f"RESULTS: {self.assignment_name}")
         print("="*70)
         print(f"  {'Name':<40} {'Attempts':>8}  {'Time Span':>12}")
         print(f"  {'-'*40}  {'-'*8}  {'-'*12}")
-        for s in self.submissions:
+        for s in active:
             span = s.get('time_span_hours') or 0.0
             span_str = self._format_time(span) if span > 0 else "—"
             print(f"  {s['name']:<40} {s['attempts']:>8}  {span_str:>12}")
 
-        # Extract metrics (exclude students with 0 attempts from stats)
-        active = [s for s in self.submissions if s.get('attempts', 0) > 0]
-        attempt_counts = [s['attempts'] for s in active]
-        time_spans = [s.get('time_span_hours') or 0.0 for s in active if (s.get('time_span_hours') or 0.0) > 0]
-
         print("\n" + "="*70)
         print(f"SUBMISSION STATISTICS — {self.assignment_name}")
         print("="*70)
-        print(f"\nTotal Students: {len(self.submissions)}")
-        print(f"Students with submissions: {len(active)}")
+        print(f"\nTotal Students (with ≥1 submission): {len(active)}")
+        if len(self.submissions) > len(active):
+            print(f"Students with no submissions (excluded): {len(self.submissions) - len(active)}")
         print(f"Students with multiple attempts: {sum(1 for a in attempt_counts if a > 1)}")
 
         if attempt_counts:
@@ -387,14 +388,25 @@ class GradescopeSeleniumStats:
 
         if has_times:
             ax = axes[plot_idx]
-            ax.hist(time_spans, bins=20, color='mediumseagreen', edgecolor='white')
-            ax.set_title("Time Span: First to Last Submission")
+            max_hours = 200
+            capped = [h for h in time_spans if h <= max_hours]
+            excluded = len(time_spans) - len(capped)
+            # Force bins over 0–200 so x-axis is always 0–200
+            bins = 20
+            ax.hist(capped, bins=bins, range=(0, max_hours), color='mediumseagreen', edgecolor='white')
+            title = "Time Span from First to Last Submission"
+            if excluded:
+                title += f"\n({excluded} student(s) excluded >200 hrs)"
+            ax.set_title(title)
             ax.set_xlabel("Hours")
             ax.set_ylabel("Number of Students")
+            ax.set_xlim(0, max_hours)
+            ax.set_ylim(bottom=0)
             ax.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
-            mean_val = statistics.mean(time_spans)
-            ax.axvline(mean_val, color='tomato', linestyle='--', linewidth=1.5, label=f'Mean: {mean_val:.1f} hrs')
-            ax.legend()
+            if capped:
+                mean_val = statistics.mean(capped)
+                ax.axvline(mean_val, color='tomato', linestyle='--', linewidth=1.5, label=f'Mean: {mean_val:.1f} hrs')
+                ax.legend()
 
         plt.tight_layout()
         import os
