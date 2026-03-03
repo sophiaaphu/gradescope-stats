@@ -715,6 +715,159 @@ def _load_roster_map(course_id, supabase_url, supabase_key):
         return {}
 
 
+def _run_roster_sync_mode(config, assignments):
+    """Roster-only mode: just sync course roster SIDs, no assignment scraping."""
+    analyzer = None
+    try:
+        first = assignments[0]
+        analyzer = GradescopeSeleniumStats(
+            config['course_id'],
+            first['assignment_id'],
+            assignment_name=first.get('assignment_name'),
+            skip_browser=False,
+        )
+        analyzer.login_with_cookies(config['cookies'])
+        analyzer.save_roster_to_supabase(config['supabase_url'], config['supabase_key'])
+    except Exception as e:
+        print(f"\nError while syncing roster: {e}")
+    finally:
+        if analyzer and analyzer.driver:
+            print("\nClosing browser...")
+            analyzer.cleanup()
+
+
+def _run_view_from_db_mode(config, assignments):
+    """Database mode: load each assignment from Supabase and show stats."""
+    roster_map = _load_roster_map(
+        config['course_id'], config['supabase_url'], config['supabase_key']
+    )
+    for assignment in assignments:
+        analyzer = GradescopeSeleniumStats(
+            config['course_id'],
+            assignment['assignment_id'],
+            assignment_name=assignment.get('assignment_name'),
+            skip_browser=True,
+        )
+        loaded = analyzer.load_from_supabase(config['supabase_url'], config['supabase_key'])
+        if loaded:
+            stat_file = _stats_filepath(analyzer.assignment_name)
+            with Tee(stat_file):
+                analyzer.calculate_statistics()
+            print(f"Stats saved to: {stat_file}")
+            analyzer.save_to_csv(roster_map)
+
+
+def _run_suspicious_mode(config, assignments):
+    """Suspicious-students mode: flag low-attempt / short-span students from DB."""
+    while True:
+        max_attempts_input = input(
+            "Flag students with FEWER than how many attempts? (e.g. 2): "
+        ).strip()
+        try:
+            max_attempts = int(max_attempts_input)
+            if max_attempts <= 0:
+                raise ValueError
+            break
+        except ValueError:
+            print("Please enter a positive integer for attempts.")
+
+    while True:
+        max_span_input = input(
+            "Flag students with LESS than how many hours between first and last submission? (e.g. 1.5): "
+        ).strip()
+        try:
+            max_span_hours = float(max_span_input)
+            if max_span_hours < 0:
+                raise ValueError
+            break
+        except ValueError:
+            print("Please enter a non-negative number for hours (e.g. 0, 0.5, 2).")
+
+    roster_map = _load_roster_map(
+        config['course_id'], config['supabase_url'], config['supabase_key']
+    )
+
+    for assignment in assignments:
+        analyzer = GradescopeSeleniumStats(
+            config['course_id'],
+            assignment['assignment_id'],
+            assignment_name=assignment.get('assignment_name'),
+            skip_browser=True,
+        )
+        loaded = analyzer.load_from_supabase(config['supabase_url'], config['supabase_key'])
+        if loaded:
+            path = analyzer.save_suspicious_students(
+                roster_map=roster_map,
+                max_attempts=max_attempts,
+                max_span_hours=max_span_hours,
+            )
+            if path:
+                print(f"Suspicious students for '{analyzer.assignment_name}' written to: {path}")
+
+
+def _run_scrape_mode(config, assignments, has_supabase):
+    """Scrape mode: open browser, loop through assignments, and collect stats."""
+    test_input = input(
+        "\nRun in TEST mode? Enter number of students to test (e.g. 3), or press Enter for all: "
+    ).strip()
+    test_limit = None
+    if test_input.isdigit() and int(test_input) > 0:
+        test_limit = int(test_input)
+        print(f"Test mode: will process only {test_limit} student(s) per assignment.")
+
+    analyzer = None
+    try:
+        # Init browser once using the first assignment
+        first = assignments[0]
+        analyzer = GradescopeSeleniumStats(
+            config['course_id'],
+            first['assignment_id'],
+            assignment_name=first.get('assignment_name'),
+            test_limit=test_limit,
+        )
+        analyzer.login_with_cookies(config['cookies'])
+        # Optionally sync roster SIDs once per run (per course)
+        roster_map = {}
+        if has_supabase:
+            sync_roster = input(
+                "\nSync course roster SIDs to Supabase? (y/n): "
+            ).strip().lower()
+            if sync_roster == 'y':
+                analyzer.save_roster_to_supabase(config['supabase_url'], config['supabase_key'])
+            roster_map = _load_roster_map(
+                config['course_id'], config.get('supabase_url'), config.get('supabase_key')
+            )
+
+        for i, assignment in enumerate(assignments):
+            print(f"\n{'='*70}")
+            print(
+                f"Assignment {i+1}/{len(assignments)}: "
+                f"{assignment.get('assignment_name') or assignment['assignment_id']}"
+            )
+            print("="*70)
+
+            analyzer.set_assignment(assignment['assignment_id'], assignment.get('assignment_name'))
+            analyzer.fetch_submissions()
+
+            stat_file = _stats_filepath(analyzer.assignment_name)
+            with Tee(stat_file):
+                analyzer.calculate_statistics()
+            print(f"Stats saved to: {stat_file}")
+            analyzer.save_to_csv(roster_map)
+
+            if has_supabase:
+                analyzer.save_to_supabase(config['supabase_url'], config['supabase_key'])
+
+    except Exception as e:
+        print(f"\nError: {e}")
+        print("\nIf authentication failed, try reconfiguring with fresh cookies.")
+
+    finally:
+        if analyzer and analyzer.driver:
+            print("\nClosing browser...")
+            analyzer.cleanup()
+
+
 def get_assignments(config):
     """Return assignments list, supporting both old single and new multi-assignment format."""
     if 'assignments' in config:
@@ -759,146 +912,13 @@ def main():
         mode = input("Enter 1: ").strip()
 
     if mode == '3' and has_supabase:
-        # --- Roster-only mode: just sync course roster SIDs, no assignment scraping ---
-        analyzer = None
-        try:
-            first = assignments[0]
-            analyzer = GradescopeSeleniumStats(
-                config['course_id'],
-                first['assignment_id'],
-                assignment_name=first.get('assignment_name'),
-                skip_browser=False,
-            )
-            analyzer.login_with_cookies(config['cookies'])
-            analyzer.save_roster_to_supabase(config['supabase_url'], config['supabase_key'])
-        except Exception as e:
-            print(f"\nError while syncing roster: {e}")
-        finally:
-            if analyzer and analyzer.driver:
-                print("\nClosing browser...")
-                analyzer.cleanup()
-
+        _run_roster_sync_mode(config, assignments)
     elif mode == '2' and has_supabase:
-        # --- Database mode: show each assignment from DB ---
-        roster_map = _load_roster_map(
-            config['course_id'], config['supabase_url'], config['supabase_key']
-        )
-        for assignment in assignments:
-            analyzer = GradescopeSeleniumStats(
-                config['course_id'],
-                assignment['assignment_id'],
-                assignment_name=assignment.get('assignment_name'),
-                skip_browser=True,
-            )
-            loaded = analyzer.load_from_supabase(config['supabase_url'], config['supabase_key'])
-            if loaded:
-                stat_file = _stats_filepath(analyzer.assignment_name)
-                with Tee(stat_file):
-                    analyzer.calculate_statistics()
-                print(f"Stats saved to: {stat_file}")
-                analyzer.save_to_csv(roster_map)
-
+        _run_view_from_db_mode(config, assignments)
     elif mode == '4' and has_supabase:
-        # --- Suspicious-students mode: flag low-attempt / short-span students from DB ---
-        while True:
-            max_attempts_input = input(
-                "Flag students with FEWER than how many attempts? (e.g. 2): "
-            ).strip()
-            try:
-                max_attempts = int(max_attempts_input)
-                if max_attempts <= 0:
-                    raise ValueError
-                break
-            except ValueError:
-                print("Please enter a positive integer for attempts.")
-
-        while True:
-            max_span_input = input(
-                "Flag students with LESS than how many hours between first and last submission? (e.g. 1.5): "
-            ).strip()
-            try:
-                max_span_hours = float(max_span_input)
-                if max_span_hours < 0:
-                    raise ValueError
-                break
-            except ValueError:
-                print("Please enter a non-negative number for hours (e.g. 0, 0.5, 2).")
-
-        roster_map = _load_roster_map(
-            config['course_id'], config['supabase_url'], config['supabase_key']
-        )
-
-        for assignment in assignments:
-            analyzer = GradescopeSeleniumStats(
-                config['course_id'],
-                assignment['assignment_id'],
-                assignment_name=assignment.get('assignment_name'),
-                skip_browser=True,
-            )
-            loaded = analyzer.load_from_supabase(config['supabase_url'], config['supabase_key'])
-            if loaded:
-                path = analyzer.save_suspicious_students(
-                    roster_map=roster_map,
-                    max_attempts=max_attempts,
-                    max_span_hours=max_span_hours,
-                )
-                if path:
-                    print(f"Suspicious students for '{analyzer.assignment_name}' written to: {path}")
-
+        _run_suspicious_mode(config, assignments)
     else:
-        # --- Scrape mode: one browser session, loop through assignments ---
-        test_input = input("\nRun in TEST mode? Enter number of students to test (e.g. 3), or press Enter for all: ").strip()
-        test_limit = None
-        if test_input.isdigit() and int(test_input) > 0:
-            test_limit = int(test_input)
-            print(f"Test mode: will process only {test_limit} student(s) per assignment.")
-
-        analyzer = None
-        try:
-            # Init browser once using the first assignment
-            first = assignments[0]
-            analyzer = GradescopeSeleniumStats(
-                config['course_id'],
-                first['assignment_id'],
-                assignment_name=first.get('assignment_name'),
-                test_limit=test_limit,
-            )
-            analyzer.login_with_cookies(config['cookies'])
-            # Optionally sync roster SIDs once per run (per course)
-            roster_map = {}
-            if has_supabase:
-                sync_roster = input("\nSync course roster SIDs to Supabase? (y/n): ").strip().lower()
-                if sync_roster == 'y':
-                    analyzer.save_roster_to_supabase(config['supabase_url'], config['supabase_key'])
-                roster_map = _load_roster_map(
-                    config['course_id'], config.get('supabase_url'), config.get('supabase_key')
-                )
-
-            for i, assignment in enumerate(assignments):
-                print(f"\n{'='*70}")
-                print(f"Assignment {i+1}/{len(assignments)}: {assignment.get('assignment_name') or assignment['assignment_id']}")
-                print("="*70)
-
-                analyzer.set_assignment(assignment['assignment_id'], assignment.get('assignment_name'))
-                analyzer.fetch_submissions()
-
-                stat_file = _stats_filepath(analyzer.assignment_name)
-                with Tee(stat_file):
-                    analyzer.calculate_statistics()
-                print(f"Stats saved to: {stat_file}")
-                analyzer.save_to_csv(roster_map)
-
-                if has_supabase:
-                    analyzer.save_to_supabase(config['supabase_url'], config['supabase_key'])
-
-        except Exception as e:
-            print(f"\nError: {e}")
-            print("\nIf authentication failed, try reconfiguring with fresh cookies.")
-
-        finally:
-            if analyzer and analyzer.driver:
-                print("\nClosing browser...")
-                analyzer.cleanup()
+        _run_scrape_mode(config, assignments, has_supabase)
 
 
 if __name__ == "__main__":
