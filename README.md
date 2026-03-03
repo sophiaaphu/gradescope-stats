@@ -5,11 +5,12 @@ A tool to analyze Gradescope autograder assignment statistics **without download
 ## Features
 
 - **Browser-Based Auth**: Uses Selenium with your session cookies — no password needed
-- **Per-Student Breakdown**: Name, attempt count, and time span (first to last submission) for every student
+- **Per-Student Export**: Name, SID, attempt count, and time span (first to last submission) for every student, saved as CSV
 - **Distribution Graphs**: Matplotlib histograms for attempts and time spans, saved as PNG files
 - **Supabase Integration**: Results are automatically saved to a database after every scrape — reload and view stats anytime without re-running the browser
+- **Suspicious-Student Detection**: Flag students with unusually few attempts and very short work times, saved to a separate text file
 - **Test Mode**: Process just a few students first to verify everything is working
-- **Two Modes**: Scrape fresh data, or view stats from a previously saved database run
+- **Multiple Modes**: Scrape fresh data, view stats from Supabase, sync roster SIDs, or generate suspicious-student lists
 
 ## Quick Start
 
@@ -17,7 +18,6 @@ A tool to analyze Gradescope autograder assignment statistics **without download
 
 ```bash
 pip install -r requirements.txt
-pip install matplotlib supabase
 ```
 
 ### 2. Set Up Supabase
@@ -34,6 +34,14 @@ CREATE TABLE submission_stats (
     first_submission_at  TIMESTAMPTZ,
     last_submission_at   TIMESTAMPTZ,
     PRIMARY KEY (assignment_id, student_name)
+);
+
+CREATE TABLE course_roster (
+  course_id      TEXT,
+  student_email  TEXT,
+  student_name   TEXT,
+  sid            TEXT,
+  PRIMARY KEY (course_id, student_email)
 );
 ```
 
@@ -69,28 +77,20 @@ See [QUICKSTART.md](QUICKSTART.md) for how to get your cookies and Supabase cred
 python gradescope_stats_selenium.py
 ```
 
-You'll be asked to choose a mode:
+If Supabase is configured in `config.json`, you'll be asked to choose a mode:
 
 ```
 What would you like to do?
   1. Scrape Gradescope (opens browser)
   2. View stats from database
-Enter 1 or 2:
+  3. Sync course roster SIDs only
+  4. Find suspicious students (from database)
+Enter 1, 2, 3, or 4:
 ```
+
+If Supabase is not configured, only option `1` is available.
 
 ## What You'll See
-
-### Per-Student Breakdown
-```
-======================================================================
-RESULTS: HW3 - Sorting Algorithms
-======================================================================
-  Name                                     Attempts     Time Span
-  ----------------------------------------  --------  ------------
-  Alice Smith                                      5       3.25 hrs
-  Bob Jones                                        2      18.50 hrs
-  Carol White                                      1             —
-```
 
 ### Aggregate Statistics
 ```
@@ -98,8 +98,8 @@ RESULTS: HW3 - Sorting Algorithms
 SUBMISSION STATISTICS — HW3 - Sorting Algorithms
 ======================================================================
 
-Total Students: 150
-Students with submissions: 148
+Total Students (with ≥1 submission): 148
+Students with no submissions (excluded): 2
 Students with multiple attempts: 112
 
 ----------------------------------------------------------------------
@@ -114,6 +114,7 @@ Std Deviation:    2.34
 ----------------------------------------------------------------------
 TIME BETWEEN FIRST AND LAST SUBMISSION
 ----------------------------------------------------------------------
+(Excluded 3 student(s) with span > 200 hrs)
 Average:       12.5 hrs
 Median:        8.3 hrs
 Min:           0.08 hrs
@@ -124,7 +125,35 @@ Max:           96.2 hrs
 
 Two histograms are saved to `stat_distribution_graphs/` as a PNG:
 - Attempt count distribution
-- Time span distribution (hours)
+- Time span distribution (hours, capped to 0–200 hrs on the x-axis, with a note about any students excluded for being >200 hrs)
+
+### Per-Student CSV Export
+
+For each assignment, a CSV is written to `stats/`:
+
+- `stats/HW3 - Sorting Algorithms_students.csv`
+
+Columns:
+
+- `Name`
+- `SID` (if available from Supabase roster)
+- `Attempts`
+- `Time Span (hrs)`
+- `First Submission`
+- `Last Submission`
+
+### Suspicious Students Files
+
+In mode `4` (“Find suspicious students”), the script:
+
+- Prompts for a maximum number of attempts (students with **fewer** than this are considered)
+- Prompts for a maximum time span in hours (students with spans **less** than this are considered)
+
+For each assignment with data in Supabase, it writes:
+
+- `stats/HW3 - Sorting Algorithms_sus_students.txt`
+
+Each line contains tab-separated: `Name`, `SID`, `Attempts`, `Span (hrs)`.
 
 ## Configuration
 
