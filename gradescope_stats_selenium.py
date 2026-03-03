@@ -13,17 +13,12 @@ from datetime import datetime
 import statistics
 import time
 import json
+import csv
 from tabulate import tabulate
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import sys
 import os
-try:
-    import openpyxl
-    from openpyxl.styles import Font, PatternFill, Alignment
-    EXCEL_AVAILABLE = True
-except ImportError:
-    EXCEL_AVAILABLE = False
 try:
     from supabase import create_client
     SUPABASE_AVAILABLE = True
@@ -305,21 +300,19 @@ class GradescopeSeleniumStats:
             print("No submission data collected.")
             return
 
-        # Only count students with at least one submission in stats and table
+        # Only count students with at least one submission in stats
         active = [s for s in self.submissions if s.get('attempts', 0) > 0]
         attempt_counts = [s['attempts'] for s in active]
-        time_spans = [s.get('time_span_hours') or 0.0 for s in active if (s.get('time_span_hours') or 0.0) > 0]
+        raw_time_spans = [
+            s.get('time_span_hours') or 0.0
+            for s in active
+            if (s.get('time_span_hours') or 0.0) > 0
+        ]
 
-        # Per-student breakdown (only students with ≥1 submission)
-        print("\n" + "="*70)
-        print(f"RESULTS: {self.assignment_name}")
-        print("="*70)
-        print(f"  {'Name':<40} {'Attempts':>8}  {'Time Span':>12}")
-        print(f"  {'-'*40}  {'-'*8}  {'-'*12}")
-        for s in active:
-            span = s.get('time_span_hours') or 0.0
-            span_str = self._format_time(span) if span > 0 else "—"
-            print(f"  {s['name']:<40} {s['attempts']:>8}  {span_str:>12}")
+        # For time-span statistics, drop extreme outliers (>200 hrs)
+        max_hours = 200
+        time_spans = [h for h in raw_time_spans if h <= max_hours]
+        excluded_time_spans = len(raw_time_spans) - len(time_spans)
 
         print("\n" + "="*70)
         print(f"SUBMISSION STATISTICS — {self.assignment_name}")
@@ -344,6 +337,8 @@ class GradescopeSeleniumStats:
             print("\n" + "-"*70)
             print("TIME BETWEEN FIRST AND LAST SUBMISSION")
             print("-"*70)
+            if excluded_time_spans > 0:
+                print(f"(Excluded {excluded_time_spans} student(s) with span > {max_hours} hrs)")
             print(f"Average:       {self._format_time(statistics.mean(time_spans))}")
             print(f"Median:        {self._format_time(statistics.median(time_spans))}")
             print(f"Min:           {self._format_time(min(time_spans))}")
@@ -353,9 +348,9 @@ class GradescopeSeleniumStats:
 
         print("\n" + "="*70 + "\n")
 
-        self._plot_distributions(attempt_counts, time_spans)
+        self._plot_distributions(attempt_counts, time_spans, excluded_time_spans)
 
-    def _plot_distributions(self, attempt_counts, time_spans):
+    def _plot_distributions(self, attempt_counts, time_spans, time_spans_excluded=0):
         """Show matplotlib distribution graphs for attempts and time spans."""
         has_attempts = len(attempt_counts) > 0
         has_times = len(time_spans) > 0
@@ -389,22 +384,20 @@ class GradescopeSeleniumStats:
         if has_times:
             ax = axes[plot_idx]
             max_hours = 200
-            capped = [h for h in time_spans if h <= max_hours]
-            excluded = len(time_spans) - len(capped)
             # Force bins over 0–200 so x-axis is always 0–200
             bins = 20
-            ax.hist(capped, bins=bins, range=(0, max_hours), color='mediumseagreen', edgecolor='white')
+            ax.hist(time_spans, bins=bins, range=(0, max_hours), color='mediumseagreen', edgecolor='white')
             title = "Time Span from First to Last Submission"
-            if excluded:
-                title += f"\n({excluded} student(s) excluded >200 hrs)"
+            if time_spans_excluded:
+                title += f"\n({time_spans_excluded} student(s) excluded >{max_hours} hrs)"
             ax.set_title(title)
             ax.set_xlabel("Hours")
             ax.set_ylabel("Number of Students")
             ax.set_xlim(0, max_hours)
             ax.set_ylim(bottom=0)
             ax.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
-            if capped:
-                mean_val = statistics.mean(capped)
+            if time_spans:
+                mean_val = statistics.mean(time_spans)
                 ax.axvline(mean_val, color='tomato', linestyle='--', linewidth=1.5, label=f'Mean: {mean_val:.1f} hrs')
                 ax.legend()
 
@@ -416,6 +409,67 @@ class GradescopeSeleniumStats:
         plt.savefig(filename, dpi=150, bbox_inches='tight')
         plt.close()
         print(f"Graph saved to: {filename}")
+    
+    def save_roster_to_supabase(self, supabase_url, supabase_key):
+        """Scrape course roster SIDs from memberships page and upsert to Supabase."""
+        if not SUPABASE_AVAILABLE:
+            print("supabase package not installed. Run: pip install supabase")
+            return
+        
+        client = create_client(supabase_url, supabase_key)
+        
+        url = f"https://www.gradescope.com/courses/{self.course_id}/memberships"
+        print(f"\nLoading roster page: {url}")
+        self.driver.get(url)
+        time.sleep(2)
+        
+        rows = self.driver.find_elements(By.CSS_SELECTOR, "tbody tr.rosterRow")
+        if not rows:
+            print("No roster rows found on memberships page.")
+            return
+        
+        roster_rows = []
+        for row in rows:
+            try:
+                # Edit button cell contains JSON with sid and full_name
+                edit_btn = row.find_element(By.CSS_SELECTOR, "td.js-editButtonCell button")
+                cm_json = edit_btn.get_attribute("data-cm")
+                info = json.loads(cm_json) if cm_json else {}
+                
+                sid = info.get("sid")
+                full_name = info.get("full_name") or (
+                    f"{info.get('first_name', '')} {info.get('last_name', '')}".strip()
+                )
+                
+                # Email is available as data-email on the button, or first column text
+                email = edit_btn.get_attribute("data-email")
+                if not email:
+                    tds = row.find_elements(By.CSS_SELECTOR, "td")
+                    email = tds[0].text.strip() if tds else None
+                
+                if not sid and not email:
+                    continue
+                
+                roster_rows.append({
+                    "course_id": self.course_id,
+                    "student_email": email,
+                    "student_name": full_name,
+                    "sid": sid,
+                })
+            except Exception as e:
+                print(f"  Error parsing roster row: {e}")
+                continue
+        
+        if not roster_rows:
+            print("No roster data extracted; nothing to save.")
+            return
+        
+        print(f"Saving {len(roster_rows)} roster rows to Supabase...")
+        client.table("course_roster").upsert(
+            roster_rows,
+            on_conflict="course_id,student_email"
+        ).execute()
+        print("Roster saved successfully.")
     
     def load_from_supabase(self, supabase_url, supabase_key):
         """Load submission data from Supabase for this assignment."""
@@ -485,59 +539,83 @@ class GradescopeSeleniumStats:
         ).execute()
         print(f"Saved successfully.")
 
-    def save_to_excel(self):
-        """Save per-student data to a formatted Excel file in the stats/ folder."""
-        if not EXCEL_AVAILABLE:
-            print("openpyxl not installed. Run: pip install openpyxl")
-            return
+    def save_to_csv(self, roster_map=None):
+        """Save per-student data to a CSV file in the stats/ folder.
+
+        Args:
+            roster_map: Optional dict mapping student_name -> sid (from Supabase).
+        """
         if not self.submissions:
             print("No data to export.")
             return
 
         os.makedirs("stats", exist_ok=True)
         safe_name = "".join(c if c.isalnum() or c in " -_" else "_" for c in self.assignment_name).strip()
-        filepath = os.path.join("stats", f"{safe_name}_students.xlsx")
+        filepath = os.path.join("stats", f"{safe_name}_students.csv")
 
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = "Submissions"
+        headers = ["Name", "SID", "Attempts", "Time Span (hrs)", "First Submission", "Last Submission"]
 
-        # Header style
-        header_font = Font(bold=True, color="FFFFFF")
-        header_fill = PatternFill("solid", fgColor="2F5496")
-        center = Alignment(horizontal="center")
+        with open(filepath, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            writer.writeheader()
 
-        headers = ["Name", "Attempts", "Time Span (hrs)", "First Submission", "Last Submission"]
-        col_widths = [35, 12, 18, 28, 28]
+            for s in self.submissions:
+                sid = roster_map.get(s.get("name")) if roster_map else None
+                span = s.get("time_span_hours") or 0.0
+                writer.writerow({
+                    "Name": s.get("name"),
+                    "SID": sid,
+                    "Attempts": s.get("attempts", 0),
+                    "Time Span (hrs)": round(span, 2) if span > 0 else "",
+                    "First Submission": s.get("first_submission_at") or "",
+                    "Last Submission": s.get("last_submission_at") or "",
+                })
 
-        for col, (header, width) in enumerate(zip(headers, col_widths), start=1):
-            cell = ws.cell(row=1, column=col, value=header)
-            cell.font = header_font
-            cell.fill = header_fill
-            cell.alignment = center
-            ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = width
+        print(f"CSV file saved to: {filepath}")
 
-        # Alternating row fill
-        alt_fill = PatternFill("solid", fgColor="DCE6F1")
+    def save_suspicious_students(self, roster_map=None, max_attempts=2, max_span_hours=1.0):
+        """Save students with low attempts and short time spans to a text file.
 
-        for row_idx, s in enumerate(self.submissions, start=2):
-            fill = alt_fill if row_idx % 2 == 0 else PatternFill()
-            span = s.get('time_span_hours') or 0.0
-            values = [
-                s.get('name'),
-                s.get('attempts', 0),
-                round(span, 2) if span > 0 else None,
-                s.get('first_submission_at'),
-                s.get('last_submission_at'),
-            ]
-            for col, value in enumerate(values, start=1):
-                cell = ws.cell(row=row_idx, column=col, value=value)
-                cell.fill = fill
-                if col in (2, 3):
-                    cell.alignment = center
+        A student is flagged if they have:
+          - attempts > 0 AND attempts < max_attempts, AND
+          - time_span_hours < max_span_hours.
+        """
+        if not self.submissions:
+            print("No data to analyze for suspicious students.")
+            return None
 
-        wb.save(filepath)
-        print(f"Excel file saved to: {filepath}")
+        suspects = []
+        for s in self.submissions:
+            attempts = s.get("attempts", 0) or 0
+            span = s.get("time_span_hours")
+            span = span if span is not None else 0.0
+
+            if attempts > 0 and attempts < max_attempts and span < max_span_hours:
+                suspects.append((s, attempts, span))
+
+        if not suspects:
+            print(f"No students met the criteria (attempts < {max_attempts}, span < {max_span_hours} hrs).")
+            return None
+
+        os.makedirs("stats", exist_ok=True)
+        safe_name = "".join(c if c.isalnum() or c in " -_" else "_" for c in self.assignment_name).strip()
+        filepath = os.path.join("stats", f"{safe_name}_sus_students.txt")
+
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(f"Suspicious students for {self.assignment_name}\n")
+            f.write(f"Criteria: attempts < {max_attempts}, span (hrs) < {max_span_hours}\n\n")
+            f.write("Name\tSID\tAttempts\tSpan (hrs)\n")
+
+            for s, attempts, span in suspects:
+                name = s.get("name") or ""
+                sid = ""
+                if roster_map:
+                    sid_val = roster_map.get(name)
+                    sid = str(sid_val) if sid_val is not None else ""
+                f.write(f"{name}\t{sid}\t{attempts}\t{span:.2f}\n")
+
+        print(f"Suspicious students file saved to: {filepath}")
+        return filepath
 
     def cleanup(self):
         """Close the browser."""
@@ -614,6 +692,29 @@ def _stats_filepath(assignment_name):
     return os.path.join("stats", f"{safe_name}_stats.txt")
 
 
+def _load_roster_map(course_id, supabase_url, supabase_key):
+    """Load {student_name -> sid} mapping from Supabase course_roster."""
+    if not SUPABASE_AVAILABLE or not (supabase_url and supabase_key):
+        return {}
+    try:
+        client = create_client(supabase_url, supabase_key)
+        result = (
+            client.table("course_roster")
+            .select("student_name,sid")
+            .eq("course_id", course_id)
+            .execute()
+        )
+        data = result.data or []
+        return {
+            row["student_name"]: row.get("sid")
+            for row in data
+            if row.get("student_name")
+        }
+    except Exception as e:
+        print(f"Warning: could not load roster SIDs from Supabase: {e}")
+        return {}
+
+
 def get_assignments(config):
     """Return assignments list, supporting both old single and new multi-assignment format."""
     if 'assignments' in config:
@@ -651,10 +752,37 @@ def main():
     print("  1. Scrape Gradescope (opens browser)")
     if has_supabase:
         print("  2. View stats from database")
-    mode = input("Enter 1 or 2: ").strip()
+        print("  3. Sync course roster SIDs only")
+        print("  4. Find suspicious students (from database)")
+        mode = input("Enter 1, 2, 3, or 4: ").strip()
+    else:
+        mode = input("Enter 1: ").strip()
 
-    if mode == '2' and has_supabase:
+    if mode == '3' and has_supabase:
+        # --- Roster-only mode: just sync course roster SIDs, no assignment scraping ---
+        analyzer = None
+        try:
+            first = assignments[0]
+            analyzer = GradescopeSeleniumStats(
+                config['course_id'],
+                first['assignment_id'],
+                assignment_name=first.get('assignment_name'),
+                skip_browser=False,
+            )
+            analyzer.login_with_cookies(config['cookies'])
+            analyzer.save_roster_to_supabase(config['supabase_url'], config['supabase_key'])
+        except Exception as e:
+            print(f"\nError while syncing roster: {e}")
+        finally:
+            if analyzer and analyzer.driver:
+                print("\nClosing browser...")
+                analyzer.cleanup()
+
+    elif mode == '2' and has_supabase:
         # --- Database mode: show each assignment from DB ---
+        roster_map = _load_roster_map(
+            config['course_id'], config['supabase_url'], config['supabase_key']
+        )
         for assignment in assignments:
             analyzer = GradescopeSeleniumStats(
                 config['course_id'],
@@ -668,7 +796,54 @@ def main():
                 with Tee(stat_file):
                     analyzer.calculate_statistics()
                 print(f"Stats saved to: {stat_file}")
-                analyzer.save_to_excel()
+                analyzer.save_to_csv(roster_map)
+
+    elif mode == '4' and has_supabase:
+        # --- Suspicious-students mode: flag low-attempt / short-span students from DB ---
+        while True:
+            max_attempts_input = input(
+                "Flag students with FEWER than how many attempts? (e.g. 2): "
+            ).strip()
+            try:
+                max_attempts = int(max_attempts_input)
+                if max_attempts <= 0:
+                    raise ValueError
+                break
+            except ValueError:
+                print("Please enter a positive integer for attempts.")
+
+        while True:
+            max_span_input = input(
+                "Flag students with LESS than how many hours between first and last submission? (e.g. 1.5): "
+            ).strip()
+            try:
+                max_span_hours = float(max_span_input)
+                if max_span_hours < 0:
+                    raise ValueError
+                break
+            except ValueError:
+                print("Please enter a non-negative number for hours (e.g. 0, 0.5, 2).")
+
+        roster_map = _load_roster_map(
+            config['course_id'], config['supabase_url'], config['supabase_key']
+        )
+
+        for assignment in assignments:
+            analyzer = GradescopeSeleniumStats(
+                config['course_id'],
+                assignment['assignment_id'],
+                assignment_name=assignment.get('assignment_name'),
+                skip_browser=True,
+            )
+            loaded = analyzer.load_from_supabase(config['supabase_url'], config['supabase_key'])
+            if loaded:
+                path = analyzer.save_suspicious_students(
+                    roster_map=roster_map,
+                    max_attempts=max_attempts,
+                    max_span_hours=max_span_hours,
+                )
+                if path:
+                    print(f"Suspicious students for '{analyzer.assignment_name}' written to: {path}")
 
     else:
         # --- Scrape mode: one browser session, loop through assignments ---
@@ -689,6 +864,15 @@ def main():
                 test_limit=test_limit,
             )
             analyzer.login_with_cookies(config['cookies'])
+            # Optionally sync roster SIDs once per run (per course)
+            roster_map = {}
+            if has_supabase:
+                sync_roster = input("\nSync course roster SIDs to Supabase? (y/n): ").strip().lower()
+                if sync_roster == 'y':
+                    analyzer.save_roster_to_supabase(config['supabase_url'], config['supabase_key'])
+                roster_map = _load_roster_map(
+                    config['course_id'], config.get('supabase_url'), config.get('supabase_key')
+                )
 
             for i, assignment in enumerate(assignments):
                 print(f"\n{'='*70}")
@@ -702,7 +886,7 @@ def main():
                 with Tee(stat_file):
                     analyzer.calculate_statistics()
                 print(f"Stats saved to: {stat_file}")
-                analyzer.save_to_excel()
+                analyzer.save_to_csv(roster_map)
 
                 if has_supabase:
                     analyzer.save_to_supabase(config['supabase_url'], config['supabase_key'])
